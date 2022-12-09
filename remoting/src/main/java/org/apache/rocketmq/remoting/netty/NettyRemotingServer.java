@@ -106,7 +106,9 @@ public class NettyRemotingServer extends NettyRemotingAbstract implements Remoti
                 return new Thread(r, "NettyServerPublicExecutor_" + this.threadIndex.incrementAndGet());
             }
         });
-
+// 根据配置设置NIO还是Epoll来作为Selector线程池
+//         * 如果是Linux平台，并且开启了native epoll，就用EpollEventLoopGroup，这个也就是用JNI，调的c写的epoll；否则，就用Java NIO的NioEventLoopGroup。
+//     1个   acceptor线程（eventLoopGroupBoss），N个IO线程（eventLoopGroupSelector），M1个worker 线程（defaultEventExecutorGroup）绑定
         if (useEpoll()) {
             this.eventLoopGroupBoss = new EpollEventLoopGroup(1, new ThreadFactory() {
                 private AtomicInteger threadIndex = new AtomicInteger(0);
@@ -185,15 +187,25 @@ public class NettyRemotingServer extends NettyRemotingAbstract implements Remoti
                     return new Thread(r, "NettyServerCodecThread_" + this.threadIndex.incrementAndGet());
                 }
             });
-
+        /**
+         * 首先来看下 RocketMQ NettyServer 的 Reactor 线程模型，
+         * 一个 Reactor 主线程负责监听 TCP 连接请求;
+         * 建立好连接后丢给 Reactor 线程池，它负责将建立好连接的 socket 注册到 selector
+         * 上去（这里有两种方式，NIO和Epoll，可配置），然后监听真正的网络数据;
+         * 拿到网络数据后，再丢给 Worker 线程池;
+         *
+         */
+        //RocketMQ-> Java NIO的1+N+M模型：1个acceptor线程，N个IO线程，M1个worker 线程。
         ServerBootstrap childHandler =
             this.serverBootstrap.group(this.eventLoopGroupBoss, this.eventLoopGroupSelector)
                 .channel(useEpoll() ? EpollServerSocketChannel.class : NioServerSocketChannel.class)
+                    //服务端处理客户端连接请求是顺序处理的，所以同一时间只能处理一个客户端连接，多个客户端来的时候
+                    // ，服务端将不能处理的客户端连接请求放在队列中等待处理，backlog参数指定了队列的大小
                 .option(ChannelOption.SO_BACKLOG, 1024)
-                .option(ChannelOption.SO_REUSEADDR, true)
-                .option(ChannelOption.SO_KEEPALIVE, false)
-                .childOption(ChannelOption.TCP_NODELAY, true)
-                .childOption(ChannelOption.SO_SNDBUF, nettyServerConfig.getServerSocketSndBufSize())
+                .option(ChannelOption.SO_REUSEADDR, true) //这个参数表示允许重复使用本地地址和端口
+                .option(ChannelOption.SO_KEEPALIVE, false) //当设置该选项以后，如果在两小时内没有数据的通信时,TCP会自动发送一个活动探测数据报文。
+                .childOption(ChannelOption.TCP_NODELAY, true) //该参数的作用就是禁止使用Nagle算法，使用于小数据即时传输
+                .childOption(ChannelOption.SO_SNDBUF, nettyServerConfig.getServerSocketSndBufSize()) //这两个参数用于操作接收缓冲区和发送缓冲区
                 .childOption(ChannelOption.SO_RCVBUF, nettyServerConfig.getServerSocketRcvBufSize())
                 .localAddress(new InetSocketAddress(this.nettyServerConfig.getListenPort()))
                 .childHandler(new ChannelInitializer<SocketChannel>() {
